@@ -4,16 +4,16 @@ The implementing agent keeps this file current. Read it at the start of every se
 
 ## Milestones (SPEC §13)
 
-Status is one of: not started, in progress, done on fakes, done on real systems, checked by a person.
+Status is one of: not started, in progress, done on fakes, done on real systems, checked by a person. SPEC §13 says what each of the two "done" bars means for each milestone.
 
 | # | Milestone | Status | Evidence: what was run and what happened | Checked by, on |
 |---|---|---|---|---|
 | 0 | Prerequisites | not started | | |
 | 1 | Walking skeleton | not started | | |
 | 2 | Jobs table | not started | | |
-| 3 | Clarify and picks | not started | | |
+| 3 | Clarify, picks, and a second bot | not started | | |
 | 4 | Escalation | not started | | |
-| 5 | Catalog pipeline | not started | | |
+| 5 | Catalog pipeline and cache | not started | | |
 | 6 | Pilot | not started | | |
 
 ## Next step
@@ -35,6 +35,10 @@ Check each item when you first write code that depends on it. Record what you ra
 | `chat.getPermalink`, `views.open`, and `chat.postEphemeral` work with the three scopes in §3 | | |
 | How many times, and how quickly, Slack retries an unacknowledged event over Socket Mode | | |
 | `(:region IS NULL OR region = :region)` runs with a typed `NULL` parameter | | |
+| One process can hold Socket Mode connections for several Slack apps at once | | |
+| Slack event ids and `view.id` values are unique within an app | | |
+| A button click and a modal submission go to the app that posted the message, including in a shared channel | | |
+| The S3 client tells a missing key from an error, and a read can be bounded at 2 s | | |
 
 ## Choices made where the spec was silent
 
