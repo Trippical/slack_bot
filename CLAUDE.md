@@ -17,6 +17,7 @@ These are the owner's decisions. They are not up for redesign. If one of them se
 - **Curated only.** The bot never runs SQL that is not a reviewed `query.sql` from the published bundle. The executor has one entry point that takes an insight id and validated parameters (§8). No SQL is built from strings, and nothing the model writes reaches SQL.
 - **The model fills in a form and code decides.** One structured-output call per question. No tool loop and no agent framework. Every field is validated (§6.3) before anything acts on it.
 - **Tiers never change what is executable.** Doc, then cache, then live, in that order (§8). The live tier is the only code that sends SQL anywhere. The cache holds rows that the live tier produced from the same reviewed query, and the refresh tool goes through the same executor. The router never sees or chooses a tier.
+- **The warehouse sits behind one adapter.** Nothing outside the adapter (§8.4) knows which SQL engine holds the data. Build the fake and the transport for the engine the workplace has, and no others. The reference engine's declaration, a few lines of data, ships either way because the sample catalog is written for it. If that engine is not the one designed in §8.5, write its section in the spec and have a person check it before you build the adapter.
 - **Doc insights are reviewed snippets.** They are posted as written. Do not search, summarise, or generate document text.
 - **Bots are config, not forks.** A new bot is a config entry and a Slack app. No per-bot code, no per-bot branch, no per-bot deployment. A bot's catalog scope avoids confusion. It is not access control.
 - **No per-user authorization, and no per-bot data isolation.** The catalog and the cache hold only data that any employee may see. Restricted questions go to people.
@@ -33,7 +34,7 @@ These are the owner's decisions. They are not up for redesign. If one of them se
 
 ## When the spec and reality disagree
 
-The spec was reviewed five times by reading. Nothing in it has been run. Expect some details to be wrong, most likely in how Slack, Databricks, or the model API actually behave.
+The spec was reviewed five times by reading. Nothing in it has been run. Expect some details to be wrong, most likely in how Slack, the warehouse, or the model API actually behave.
 
 - **A fact about an external API is different**, such as a field name, an error code, or a limit. Follow reality, correct `SPEC.md` in the same change, and note it in `docs/PROGRESS.md`.
 - **Behaviour would change**, meaning what a user or analyst sees, what is stored, or how a failure is handled. Stop and ask.
@@ -46,7 +47,7 @@ Keep `SPEC.md` true. Code and a spec that have drifted apart are the worst outco
 ## Testing
 
 - Most of the bugs found in review were in the failure paths: the worker loop, the sweeper, the failure notifier, pick handling, and `ensure_escalation`. They depend on Postgres locking and transaction behaviour, so test them against a real Postgres, not a mock.
-- Slack, Databricks, the model, and the object store have fakes (§10.4), switched on together by one flag. Postgres is never faked. A milestone is done only when its real-system column in §13 has been shown. Say plainly which results came from fakes.
+- Slack, the warehouse, the model, and the object store have fakes (§10.4), switched on together by one flag. Postgres is never faked. A milestone is done only when its real-system column in §13 has been shown. Say plainly which results came from fakes.
 - The fake router returns fixture decisions. A green routing eval on the sample catalog proves the harness, not a model.
 - The example and negative utterances in the catalog are the routing tests. Never put them in the router prompt. Doing so would grade the model on questions it has already seen.
 

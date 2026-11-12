@@ -10,13 +10,14 @@ If this file and `SPEC.md` disagree about what is needed, the spec wins.
 |---|---|---|
 | 1 | Can CI reach production Postgres to publish catalog bundles? If not, publishing runs as a one-off job inside the platform. | |
 | 2 | Who is on call for the bot? Who staffs the analyst queue? Who in data governance approves and grants new source tables? | |
-| 3 | Is there a separate dev Databricks warehouse for CI? | |
+| 3 | Is there a separate dev warehouse for CI? | |
 | 4 | Which model and provider does the router use: Databricks, Bedrock, Fireworks, or another OpenAI-compatible endpoint? | |
 | 5 | Which three real queries, on which tables, seed the real-system check of milestone 1? Paste them in section 4. The offline build does not need them. | |
-| 6 | Which environments exist? The spec assumes dev and prod, each with its own Slack app per bot, Postgres, bucket or prefix, config file, and service principal per credentials block. | |
+| 6 | Which environments exist? The spec assumes dev and prod, each with its own Slack app per bot, Postgres, bucket or prefix, config file, and warehouse identity per credentials block. | |
 | 7 | Which CI platform, image registry, container platform, and scheduler? Who owns them? | |
 | 8 | Which bots exist at launch? One is a fine answer. Fill in one copy of section 2a for each. | |
 | 9 | Which bucket holds cached answers, who may write to it, what is its lifecycle expiry, and which scheduler runs the cache refresh? Not needed before milestone 5. | |
+| 10 | Which SQL engine holds the data, and does it offer what SPEC §8.4 asks for: named bound parameters, a read-only identity with table grants, a server-side timeout, a row limit that reports a cut-off, and a readable query history? Databricks SQL is already designed (§8.5). Any other engine needs its adapter section written first. | |
 
 ## 2. Identifiers and access
 
@@ -44,12 +45,12 @@ Bot id. It starts with a lowercase letter, then lowercase letters, digits, and u
 | What | Goes in | Dev | Prod |
 |---|---|---|---|
 | Postgres connection string | env `DATABASE_URL` | stored at: | stored at: |
-| Databricks workspace host | `config.yaml` `databricks.host` | | |
-| Databricks SQL warehouse ID | `config.yaml` `databricks.warehouse_id` | | |
-| Service principal client ID and secret, once per credentials block | env `<env_prefix>DATABRICKS_CLIENT_ID`, `<env_prefix>DATABRICKS_CLIENT_SECRET` | stored at: | stored at: |
-| `SELECT` grants on the seed tables, for every service principal whose bots offer those insights | Unity Catalog | granted by, on: | granted by, on: |
+| Warehouse provider, the adapter name | `config.yaml` `warehouse.provider` | | |
+| The adapter's own settings. For Databricks SQL: workspace host and SQL warehouse ID | `config.yaml` `warehouse.host`, `warehouse.warehouse_id` | | |
+| Warehouse identity credentials, once per credentials block. For Databricks SQL: a service principal's client ID and secret | env, named by the adapter. Databricks SQL: `<env_prefix>DATABRICKS_CLIENT_ID`, `<env_prefix>DATABRICKS_CLIENT_SECRET` | stored at: | stored at: |
+| Read grants on the seed tables, for every warehouse identity whose bots offer those insights | the warehouse's permissions | granted by, on: | granted by, on: |
 | Model provider, endpoint, and model name | `config.yaml` `router.provider`, `router.endpoint`, `router.model` | | |
-| Model credentials | env `LLM_API_KEY` or the provider's own | stored at: | stored at: |
+| Model credentials | env `LLM_API_KEY`, or the variables the model adapter lists (SPEC §6.1) | stored at: | stored at: |
 | Cache bucket and key prefix | `config.yaml` `cache.bucket`, `cache.prefix` | | |
 | Cache store endpoint, if the store needs one | `config.yaml` `cache.endpoint` | | |
 | Bucket access: read for the bot, write for the refresh tool only | the platform's identity or env credentials | granted by, on: | granted by, on: |
@@ -58,8 +59,8 @@ Bot id. It starts with a lowercase letter, then lowercase letters, digits, and u
 | When the source tables' daily load finishes | the refresh schedule | | |
 | Where the service runs | the adopter's deployment | | |
 | Where each environment's config file lives | env `CONFIG_PATH` | | |
-| Outbound network access to Slack, Databricks, the model endpoint, and the object store | network policy | confirmed by: | confirmed by: |
-| Fiscal year start, first day of a month | `catalog/calendar.yaml` | | |
+| Outbound network access to Slack, the warehouse, the model endpoint, and the object store | network policy | confirmed by: | confirmed by: |
+| Fiscal year start (the first day of a month), the first day of the week, and the timezone that dates are resolved in | `catalog/calendar.yaml` | | |
 
 ## 3. Slack app manifest
 

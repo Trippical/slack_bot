@@ -27,8 +27,8 @@ Check each item when you first write code that depends on it. Record what you ra
 | Item | Result | How it was checked, and when |
 |---|---|---|
 | The chosen model returns schema-valid structured output at temperature 0 | | |
-| An omitted parameter `value` binds `NULL` on the Statement Execution API | | |
-| The warehouse result cache hits for an identical statement with identical bound parameters | | |
+| Databricks SQL adapter: an omitted parameter `value` binds `NULL`, a statement that reaches `wait_timeout` is cancelled on the warehouse, `JSON_ARRAY` returns cells as strings with the column types in the manifest, and the token request works as written | | |
+| The warehouse's own result cache, if it has one, hits for an identical statement with identical bound parameters | | |
 | The `view_submission` payload carries `view.id` and `private_metadata` | | |
 | Socket Mode needs only `connections:write` on the app-level token | | |
 | The Slack error codes for a deleted thread and a deleted message, and the passing error codes named in §5.3 | | |
@@ -39,6 +39,7 @@ Check each item when you first write code that depends on it. Record what you ra
 | Slack event ids and `view.id` values are unique within an app | | |
 | A button click and a modal submission go to the app that posted the message, including in a shared channel | | |
 | The S3 client tells a missing key from an error, and a read can be bounded at 2 s | | |
+| For a warehouse adapter other than the reference one: each of the eight points in SPEC §8.4, checked against the real engine | | |
 
 ## Choices made where the spec was silent
 

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Ready for handoff, v1.2 |
+| Status | Ready for handoff, v1.3 |
 | Date | 2026-11-12 |
 | Owner | (fill in) |
 | Guiding tenet | Keep it simple. Anything not in the build order (§13) is in Appendix B. |
@@ -12,9 +12,11 @@
 
 ## 1. Summary
 
-Employees @mention a bot in approved Slack channels and get an answer in the thread. Every answer comes from a **curated catalog**: a reviewed, parameterized Databricks query, a reviewed text snippet, or a link to a dashboard. The bot never writes SQL. Questions the catalog cannot answer go to human analysts in a Slack queue channel. Analysts add new catalog entries through a pull request, with a coding agent doing the scaffolding.
+Employees @mention a bot in approved Slack channels and get an answer in the thread. Every answer comes from a **curated catalog**: a reviewed, parameterized SQL query against the company's data warehouse, a reviewed text snippet, or a link to a dashboard. The bot never writes SQL. Questions the catalog cannot answer go to human analysts in a Slack queue channel. Analysts add new catalog entries through a pull request, with a coding agent doing the scaffolding.
 
 Runtime is **one service with two replicas**, **one managed Postgres**, and an object store for precomputed answers. Routing is one LLM call with structured output, followed by deterministic validation in code. An answer is then served by the cheapest tier that can serve it: a snippet, a fresh precomputed result, or a live query (§8).
+
+The **warehouse** is whichever SQL engine already holds the data. The bot reaches it through one small adapter (§8.4), and nothing else in the design depends on which engine it is. Databricks SQL is the worked example (§8.5).
 
 One deployment can run **several bots**. A bot is a config entry with its own Slack identity, channels, wording, and slice of the catalog. Bots share everything else.
 
@@ -46,18 +48,18 @@ A few thousand employees, a few hundred questions a day, short bursts of 5 to 10
                                               ├─ workers (16 async tasks): claim job ─▶ route ─▶ validate ─▶ select tier ─▶ serve ─▶ reply
                                               └─ housekeeping (every 60 s): sweeper, failure notifier, bundle poll
                                                   │              │                │                 │
-                                             Postgres        LLM endpoint    Databricks SQL     Object store
+                                             Postgres        LLM endpoint    Warehouse          Object store
                                         (jobs, catalog,   (workspace-level)  (bound parameters, (cached answers,
-                                         escalations)                         service principal)  read only)
+                                         escalations)                         read-only identity) read only)
 
- cache refresh tool (scheduled by the adopter) ──▶ Databricks SQL ──▶ Object store
+ cache refresh tool (scheduled by the adopter) ──▶ Warehouse ──▶ Object store
 ```
 
 | Component | What it is | Role |
 |---|---|---|
 | **insight-bot** | One service, 2 fixed replicas, one image | Each replica runs one Slack listener per bot, the worker tasks, and the housekeeping tasks in one process. |
 | **Postgres** | Managed, outside the service | Job queue, audit log, escalations, feedback, published catalog bundle. One database. |
-| **Databricks SQL warehouse** | Existing serverless warehouse | Runs catalog queries through the Statement Execution API under a read-only service principal. |
+| **Warehouse** | The SQL engine that already holds the data. Any engine with an adapter (§8.4). | Runs catalog queries with bound parameters under a read-only identity. Databricks SQL is the worked example (§8.5). |
 | **LLM endpoint** | Provided at the workspace level (Databricks Model Serving, Bedrock, Fireworks, or any OpenAI-compatible endpoint) | One structured-output call per question. Chosen at implementation, see §6.1. |
 | **Object store** | Any S3-compatible store | Holds cached answer objects (§8.2). Workers read it. Only the cache refresh tool (§8.3) writes it. |
 | **This repo** | Git | Bot code and the catalog live together. CI publishes the catalog without redeploying the bot. |
@@ -221,6 +223,7 @@ async def worker(name):
             await asyncio.sleep(1)
 
 # 16 tasks per replica. The work is I/O bound. All tasks share one pool of 10 Postgres connections.
+# REPLICA_NAME is the host name, which the platform makes unique for each replica.
 await asyncio.gather(*(worker(f"{REPLICA_NAME}-{i}") for i in range(16)))
 ```
 
@@ -231,7 +234,7 @@ Workers are shared by all bots. A job is handled as the bot named in its `bot_id
 1. If `posted_ts` is set, the reply already went out. Return.
 2. If `decision` is empty: load thread context (§6.5), call the router (§6.2), validate (§6.3), apply the decision policy (§6.4). Save `bundle_sha`, `decision`, `insight_id`, `params`, `confidence`, `rationale`, `clarifying_question`, `options`, and `escalation_reason` in one update. The model's `parameters` are called `params` once validated. A clarify also saves the `insight_id` and the parameters that did validate, so a typed reply can build on them. Clarify text that code writes, such as "Which region?", is saved to `clarifying_question` the same way the model's is. Whenever code turns a result into `no_match`, it saves `decision = no_match` with `escalation_reason = no_match`, unless §6.4 names a more specific reason.
 3. Act on the saved decision. If the saved `bundle_sha` is no longer the live bundle, re-validate the saved insight and parameters first, including that the insight is still in the bot's scope. If that fails, a question job saves `decision = no_match` with `escalation_reason = no_match` and acts on that. A pick job saves `decision = stale_option`.
-   - `answer`, query insight: call the executor (§8), which serves from the cache tier or the live tier. Save `tier`, `served_as_of`, `statement_id`, and `rows_returned`, render (§8.1), post the reply.
+   - `answer`, query insight: call the executor (§8), which serves from the cache tier or the live tier. Save `tier`, `served_as_of`, `statement_id`, and `rows_returned`, render (§8.1), post the reply. If the executor raises `WarehouseFailed` (§8.4) with a `statement_id`, save it on the job and raise again, so a failed statement can still be found in query history.
    - `answer`, doc insight: save `tier = doc` and post the snippet with the doc footer (§5.5). Nothing is executed and nothing is fetched.
    - `answer`, dashboard insight: post the title, description, and link with the standard footer. Nothing is executed. `tier` stays NULL.
    - `clarify`: post the saved `clarifying_question`. If `options` is a list, add one button per option plus **None of these**. If `options` is NULL, the message is the typed form and has no buttons.
@@ -257,7 +260,7 @@ If a pick job fails, its buttons stop responding because the key `<bot>:pick:<j>
 
 ### 5.3 Failure handling
 
-- **Upstream retries happen inside `handle`.** Slack 429: sleep for the `Retry-After` value and retry. LLM or Databricks 429, 5xx, or network error: retry after 1 s, then after 3 s, but only while enough of the job's time cap remains for another full attempt. A query that Databricks reports as `FAILED` or `CANCELED` is not retried. HTTP client timeouts are 10 s for the LLM and `timeout_s` plus 5 s for Databricks. A cache read has a 2 s timeout and is never retried (§8). One clean pass is at most 10 s, plus 2 s, plus 35 s, which fits the cap.
+- **Upstream retries happen inside `handle`.** Slack 429: sleep for the `Retry-After` value and retry. LLM or warehouse rate limit, server error, or network error: retry after 1 s, then after 3 s, but only while enough of the job's time cap remains for another full attempt. The model adapter raises `LLMRetryable` for these (§6.1) and the warehouse adapter raises `WarehouseRetryable` (§8.4). The LLM retry loop is in `handle`. The warehouse retry loop is in the executor's live tier, which `handle` gives its deadline (§8). That way a retry never repeats the cache read, and the refresh tool and the CI checks retry the same way. A query that the warehouse reports as failed, cancelled, or cut off, or that gets no reply in time, is not retried (§8.4). Client timeouts are 10 s for the LLM and `timeout_s` plus 5 s for the warehouse. A cache read has a 2 s timeout and is never retried (§8). One clean pass is at most 10 s, plus 2 s, plus 35 s, which fits the cap.
 - **Any exception or timeout fails the job.** There is no automatic re-queue of a live attempt. The failure notifier tells the user.
 - **Sweeper, for dead replicas only.** Every 60 s, from every replica:
   ```sql
@@ -330,7 +333,7 @@ Every reply goes in the thread of the triggering message. The triggers are fixed
 | Help | Mention with no text | "Ask me about company metrics and definitions. For example: how many weekly active users did we have last month?" |
 | Scope note | `not_a_data_question` | "I answer questions about company metrics from an approved catalog. Ask me for a number, a trend, a definition, or a dashboard." |
 | Did you mean | `answer` below `T` | "Did you mean one of these?" plus option buttons |
-| Parameter clarify, buttons | Exactly one unresolved parameter, an enum with 5 or fewer values | "Which <parameter name>?" plus one button per value |
+| Parameter clarify, buttons | Exactly one unresolved parameter, an enum with 5 or fewer values | "<insight title>: which <parameter name>?" plus one button per value |
 | Parameter clarify, typed | Any other unresolved parameter, or more than one | One line per unresolved parameter: "Which <parameter name>? I accept: <the allowed values, or 'a period such as last month or 2026-01-01 to 2026-03-31', or 'a whole number from <min> to <max>'>." Then "Reply here and mention me." |
 | Model clarify | `clarify` | The sanitised `clarifying_question` plus option buttons |
 | Escalation reply | `no_match` | "I don't have an approved insight for that yet. I've passed it to the analytics team, who will reply in this thread." |
@@ -368,7 +371,9 @@ def parse_decision(raw: dict, scope) -> RouteDecision: ...        # schema check
 # One small adapter per provider, selected by config. Transport only.
 # Adapter names: databricks, bedrock, fireworks, openai_compatible, and fake (offline mode, §10.4).
 # Build fake, openai_compatible, and the adapter for the provider the workplace chose. Add another only when it is chosen.
+class LLMRetryable(Exception): ...      # rate limited, server error, or network error. handle retries it (§5.3).
 class LLMClient(Protocol):
+    env_vars: tuple[str, ...]           # the credential variables this adapter reads. The startup check names missing ones (§12.1).
     async def complete(self, system: str, user: str, schema: dict) -> dict: ...
 ```
 
@@ -385,7 +390,9 @@ enterprise
 </question>
 ```
 
-Cards are serialised as the YAML shown in §6.2, in `id` order. A turn is built from one earlier job row (§6.5). `RouteDecision` holds the fields of the output schema in §6.2.
+Cards are serialised as the YAML shown in §6.2, in `id` order. A turn is built from one earlier job row (§6.5). `RouteDecision` holds the fields of the output schema in §6.2. `params` in a turn is the saved full parameter set (§6.3) as compact JSON. The example above leaves out the parameters that hold `null` to stay short, and the real message prints them all.
+
+Model credentials: the `openai_compatible` and `fireworks` adapters read `LLM_API_KEY`. Any other adapter names its own variables, following its provider's convention, and lists them in `env_vars`. Model credentials do not go through a credentials block (§12.2), and a model adapter does not borrow the warehouse identity's variables, also when one vendor serves both.
 
 Requirements for whichever model is chosen:
 1. **Structured output.** Preferred: a forced tool or function call, or JSON-schema-constrained output. Acceptable: plain JSON mode with the schema pasted at the end of the system prompt. The adapter hides the difference and `parse_decision` checks the result either way.
@@ -497,7 +504,7 @@ The validator's output is the **full parameter set**: one entry for every parame
 not_a_data_question                         → one-line note on what the bot answers. No escalation.
 answer, confidence ≥ T, params valid        → serve (§8) and reply.
 answer, confidence < T, params valid        → clarify: "Did you mean one of these?" with the answer and its runners-up as buttons.
-answer, a param missing or invalid          → clarify on that parameter: "Which <name>?" with buttons, or the typed form (see below).
+answer, a param missing or invalid          → clarify on that parameter, at any confidence: "<title>: which <name>?" with buttons, or the typed form (see below).
 clarify                                     → post the model's question with its options as buttons.
 no_match                                    → reply and escalate (§9). Any options are saved for the analysts' card.
 ```
@@ -506,7 +513,8 @@ Exact texts are in §5.5.
 
 - `T` is `router.confidence_threshold` in `config.yaml`, starting at **0.80**. Model confidence is treated as a ranking signal, not a probability. Re-check `T` against the eval set whenever the model changes.
 - Below the threshold the bot does not guess. It offers buttons.
-- Every option is validated before it becomes a button. Invalid options are dropped. A "Did you mean" message always has at least one button, the answer itself. A model clarify left with no valid options still posts its question with only **None of these**, and the user can reply by mentioning the bot. A model clarify with no valid options and no question text becomes `no_match`.
+- A missing or invalid parameter is asked about whatever the confidence. The button message names the insight, so a click confirms the insight and the value together, and a pick is not checked against `T` again. A typed reply is a new mention and is routed afresh.
+- Every option is validated before it becomes a button. Invalid options are dropped. A "Did you mean" message always has at least one button, the answer itself. A model clarify left with no valid options still posts its question with only **None of these**, and the user can reply by mentioning the bot. A model clarify with no valid options and no question text becomes `no_match`. A model clarify with valid options and no question text uses "Did you mean one of these?".
 - Every button message also carries a **None of these** button (index `-1`), which escalates.
 - Button labels are built by code from the insight title and parameter values. The only model-written text a user ever sees is `clarifying_question`, which is capped at 300 characters with URLs, mentions, and Slack markup stripped.
 - A parameter clarify shows buttons only when exactly one parameter is unresolved, meaning missing with no default or given an invalid value, and it is an enum with 5 or fewer values. Each button is the answer with that value filled in, so it validates. In every other case, including two or more unresolved parameters, it uses the typed form: it names each unresolved parameter, lists what is accepted, and asks the user to reply with a mention. The typed form saves its whole text in `clarifying_question` and saves `options` as NULL. A button message always saves `options` as a list, even an empty one.
@@ -654,7 +662,7 @@ cases:
 
 - `insight.yaml` matches the schema. `id` is unique.
 - Every declared parameter is used in the SQL. An `enum` or `integer` named `x` appears as `:x`. A `date_range` named `x` appears as both `:x_start` and `:x_end`. Every marker in the SQL maps back to a declared parameter.
-- The SQL parses with sqlglot as exactly one `SELECT` or `WITH` statement. No `;`, no DDL, no DML.
+- The SQL parses with sqlglot, in the dialect of the configured warehouse adapter (§8.4), as exactly one `SELECT` or `WITH` statement. No `;`, no DDL, no DML.
 - The tables sqlglot finds in the SQL equal `source_tables`.
 - `timeout_s` is between 5 and 30. `max_rows` is at most 500.
 - Parameter types are from §6.3 only. No `string`.
@@ -668,7 +676,7 @@ cases:
   - Every grid value validates under §6.3 and is written in the catalog's spelling. `null` is allowed only for an optional parameter.
   - A grid value for a `date_range` is a named token, never an ISO pair.
   - No value is repeated within a key. The grid has at most 200 combinations.
-- `bots`, when present, is a non-empty list, and every id in it is a bot in `config.yaml`. The compiler reads `config.yaml` for this check.
+- `bots`, when present, is a non-empty list, and every id in it is a bot in `config.yaml`. The compiler reads `config.yaml` for this check and for the warehouse dialect.
 
 ### 7.3 Publishing
 
@@ -696,13 +704,13 @@ cases:
     }
   }
   ```
-  The calendar block lives in `catalog/calendar.yaml` and ships in the bundle, so CI and the bot resolve dates the same way. The milestone 1 bundle is this shape written by hand.
+  The calendar block lives in `catalog/calendar.yaml` and ships in the bundle, so CI and the bot resolve dates the same way. The example is shortened: the real `parameters` list declares every parameter, here `region` and `plan_tier` as well as `period`. The milestone 1 bundle is this shape written by hand.
   - A doc insight carries its snippet text inlined, the same way a query insight carries its SQL.
   - `cache`, `bots`, and `dashboard_url` are carried as written. Each is left out when the insight does not have it.
   - `query_sha` is added by the compiler to every query insight that has a `cache` block. It is the SHA-256 of the SQL text, the `parameters` list, `max_rows`, and the calendar block, as canonical JSON. It names the cache objects (§8.2), so it changes exactly when a cached result could.
 - On merge to main, when anything under `catalog/` changed, CI runs `tools/publish.py`: insert the bundle keyed by commit SHA with `ON CONFLICT (sha) DO NOTHING`, then `INSERT INTO catalog_pointer (id, sha) VALUES (true, $1) ON CONFLICT (id) DO UPDATE SET sha = EXCLUDED.sha, updated_at = now()`. CI connects as a Postgres role that can write only these two tables.
 - Each replica loads the live bundle before it starts claiming jobs, then polls the pointer every 60 s and swaps bundles in memory when the SHA changes.
-- **Rollback** is re-pointing to an earlier SHA with `python tools/publish.py --rollback <sha>`. Replicas converge within a minute. No redeploy.
+- **Rollback** is re-pointing to an earlier SHA with `python -m tools.publish --rollback <sha>`. Replicas converge within a minute. No redeploy.
 - **Removing an insight** means deleting its directory. Git keeps the history.
 - Publishing does not touch the cache. Objects are named by `query_sha`, so a publish that leaves an insight's query alone leaves its cache valid, and a publish that changes the query makes that insight run live until the next refresh (§8.3). Run the refresh tool after a publish if that gap matters.
 
@@ -730,38 +738,21 @@ An answer is served by the first tier that can serve it. The order is fixed.
 
 Rules:
 
-- **The executor's only entry point takes `(insight_id, validated_params)`.** It reads the SQL from the in-memory bundle. No function in the bot accepts SQL text from anywhere else. This is what makes "curated only" a property of the code and not of a prompt. Tier selection between cache and live happens inside this entry point, so no caller can make the cache serve. The entry point has two keyword settings, and neither carries SQL: `credentials`, the name of a credentials block in config, and `live_only`, which can only skip the cache read. The refresh tool and the CI execution checks set `live_only`. The bot never does.
-- **Tiers never change what is executable.** The doc tier executes nothing. The cache tier executes nothing: it returns rows that the live tier produced earlier from the same reviewed `query.sql` with the same validated parameters. The live tier is the only code path that sends SQL anywhere.
+- **The executor's only entry point takes `(insight_id, validated_params)`.** It reads the SQL from the in-memory bundle. No function in the bot accepts SQL text from anywhere else. This is what makes "curated only" a property of the code and not of a prompt. Tier selection between cache and live happens inside this entry point, so no caller can make the cache serve. The entry point has three keyword settings, and none carries SQL: `credentials`, the name of a credentials block in config. `live_only`, which can only skip the cache read. And `deadline`, the time by which the caller needs the result, which can only stop the live tier from starting a retry it could not finish (§5.3). The refresh tool and the CI execution checks set `live_only` and pass no deadline. The bot never sets `live_only` and always passes the job's deadline.
+- **Tiers never change what is executable.** The doc tier executes nothing. The cache tier executes nothing: it returns rows that the live tier produced earlier from the same reviewed `query.sql` with the same validated parameters. The live tier is the only code path that sends SQL anywhere, and it does so through the warehouse adapter (§8.4), which nothing else calls.
 - **The router never sees tiers.** Routing, validation, and the decision policy are the same whichever tier serves. A tier is chosen only after an `answer` has been validated.
 - **A cache miss is silent.** A missing object, a stale object, a point off the grid, or a read that takes longer than 2 s falls through to live, and the user sees only a live answer. A corrupt object or any error from the store does the same and is logged at error level. A cache read is never retried, and a cache problem never fails a job. The price of silence is that a broken cache looks like a slow day, so §12.3 has a saved query for cached insights that are not being served from the cache.
-- The executor returns the rows together with `tier`, `as_of`, and `statement_id`, and the worker saves them (§5.2). For a cache answer, `statement_id` is the one recorded in the object, so a cached answer still traces back to the statement that produced it.
+- The executor returns `columns`, `rows`, `resolved_params`, `tier`, `as_of`, and `statement_id`. `as_of` is when the statement finished, on either tier. The worker saves `tier`, `statement_id`, and, for a cache answer only, `as_of` as `served_as_of` (§5.2). The refresh tool writes the returned values into the object as they are (§8.2), so dates are never resolved a second time. For a cache answer, `statement_id` is the one recorded in the object, so a cached answer still traces back to the statement that produced it.
 - A dashboard insight never reaches the executor. A doc insight is handled by the worker directly, because there is nothing to execute.
 
 ### Live tier
 
-- **Service principal:** one per credentials block (§12.2), named to the adopter's convention, for example `sp-insightbot-<env>`. Each has OAuth client credentials, `CAN USE` on one warehouse, and `SELECT` on approved tables only. When a pull request adds a new entry to `source_tables`, a person in data governance grants `SELECT` by hand to every credentials block whose bots have the insight in scope. With one block, that is one grant. The pull request template has a checkbox for it. A missing grant shows up as a failed query, which escalates to an analyst and logs a permission error.
-- **Request:** one call to `POST /api/2.0/sql/statements`.
-  ```json
-  {
-    "warehouse_id": "<from config>",
-    "statement": "<SQL from the bundle>",
-    "parameters": [
-      {"name": "period_start", "value": "2026-10-12", "type": "DATE"},
-      {"name": "period_end",   "value": "2026-11-09", "type": "DATE"},
-      {"name": "region",       "value": "EMEA",       "type": "STRING"},
-      {"name": "plan_tier",    "type": "STRING"}
-    ],
-    "wait_timeout": "30s",
-    "on_wait_timeout": "CANCEL",
-    "row_limit": 500,
-    "disposition": "INLINE",
-    "format": "JSON_ARRAY"
-  }
-  ```
-  `wait_timeout` is the insight's `timeout_s` and `row_limit` is its `max_rows`. The call blocks until the statement finishes or Databricks cancels it, so there is no polling loop. A parameter with no `value` binds `NULL`, which is how unset optional parameters are passed. Type mapping: `date_range` gives two `DATE` parameters, `enum` gives `STRING`, `integer` gives `BIGINT`.
-- **Outcomes:** `SUCCEEDED` with `truncated: false` returns rows inline. Anything else raises, the job fails, and the notifier escalates. That includes `FAILED`, `CANCELED`, and a result marked `truncated: true`, because a cut-off result can show the wrong latest value. Save `statement_id` on the job either way.
+- **Warehouse identity:** the read-only account the bot signs in to the warehouse as. There is one per credentials block (§12.2), named to the adopter's convention. Each may run queries and read approved tables, and nothing else. When a pull request adds a new entry to `source_tables`, a person in data governance grants read access by hand to every credentials block whose bots have the insight in scope. With one block, that is one grant. The pull request template has a checkbox for it. A missing grant shows up as a failed query, which escalates to an analyst and logs a permission error.
+- **Call:** the executor reads the SQL from the bundle, turns the full parameter set (§6.3) into a list of typed parameters, and makes one call to the warehouse adapter (§8.4) with the insight's `timeout_s` and `max_rows`. Type mapping: a `date_range` named `x` gives two `date` parameters, `x_start` and `x_end`. An `enum` gives a `string`. An `integer` gives an `integer`. An unset optional parameter is passed as `None` and binds `NULL`. The adapter maps these three types to the engine's own.
+- **Retries:** a `WarehouseRetryable` error is retried here, after 1 s and then after 3 s, unless the caller's `deadline` leaves no room for another full attempt (§5.3). The cache read is not repeated.
+- **Outcomes:** a complete result returns its rows. Anything else raises, the job fails, and the notifier escalates. That includes a statement the warehouse reports as failed, one cancelled at the timeout, and a result cut off at the row limit, because a cut-off result can show the wrong latest value. The worker saves `statement_id` on the job whenever the warehouse returned one, for a failed statement too (§5.2).
 - **Credentials:** the live tier runs under the credentials block named by the job's bot (§12.2). Every bot uses `default` unless its config says otherwise. A second block exists for operational reasons, such as a separate budget or a separate line in query history. It is not a data boundary: the cache is shared by all bots, and every credentials block must be able to read every table used by the insights in its bots' scopes.
-- **Warehouse result cache:** the warehouse's own result cache also serves repeated identical statements. It is separate from the cache tier and needs nothing from the bot.
+- **Warehouse result cache:** many engines keep a result cache of their own, which also serves repeated identical statements. It is separate from the cache tier and needs nothing from the bot.
 
 ### 8.1 Rendering
 
@@ -811,7 +802,7 @@ class Store(Protocol):
 }
 ```
 
-`as_of` is when the statement finished. `rows` is what the live tier returned, in the same form, so the renderer cannot tell the difference.
+`as_of` is when the statement finished. `rows` is what the live tier returned, in the normal form of §8.4, so the renderer cannot tell the difference.
 
 **Read, in order. Any "no" is a miss and the live tier runs:**
 
@@ -851,8 +842,107 @@ The cache holds nothing that is not already answerable by any employee through t
 - **Truncated or failed results are never cached.** The live tier raises on them (§8, Live tier), so nothing is written.
 - **Logging:** one line per object with insight, parameters, rows, and timing, and a summary line with counts.
 - **Flags:** `--insight <id>` refreshes one insight. `--dry-run` lists the points, and whether each already has an object, without running anything.
-- **Scheduling is the adopter's choice.** The tool is a plain command that needs the bot's config, Postgres, the warehouse, and write access to the bucket (§12.2 lists its environment variables). Schedule it more often than the smallest `max_age`. Schedule one run each day after midnight in the calendar timezone and after the source tables' daily load has finished, for the reasons in §8.2. Run it after a publish that changes a cached query if a live-only gap matters.
+- **Scheduling is the adopter's choice.** The tool is a plain command that needs the bot's config, Postgres, the warehouse, and write access to the bucket (§12.1 says what it needs at startup and §12.2 lists the variables). Schedule it more often than the smallest `max_age`. Schedule one run each day after midnight in the calendar timezone and after the source tables' daily load has finished, for the reasons in §8.2. Run it after a publish that changes a cached query if a live-only gap matters.
 - **Cost check.** The refresh runs every grid point every time, whether or not anyone asks. A grid is worth having when its points are asked for more often than they are refreshed. The saved queries in §12.3 show `tier` by insight, which is how to tell.
+
+### 8.4 Warehouse adapter
+
+The warehouse is whichever SQL engine holds the data. The live tier reaches it through one adapter, selected by `warehouse.provider` in config (§12.2). The router, the validator, the tiers, the cache, and the renderer are the same for every engine.
+
+An adapter has two parts:
+
+- **The declaration** is a few lines of data about the engine: its name, its SQL dialect, the credential variables it reads, and the config keys it takes. The compiler, the config loader, and the startup check read it. It does no I/O.
+- **The transport** is the module that talks to the engine. Only the executor's live tier calls it.
+
+```python
+# bot/warehouse/base.py: the interface. Any module may import it.
+@dataclass(frozen=True)
+class Param:
+    name: str                               # the marker name, for example period_start
+    type: Literal["date", "string", "integer"]
+    value: date | str | int | None          # None binds NULL
+
+@dataclass(frozen=True)
+class QueryResult:
+    columns: list[str]
+    rows: list[list]                        # cells in the normal form below
+    statement_id: str                       # the engine's own id for this statement
+
+class WarehouseRetryable(Exception): ...    # rate limited, server error, or network error. The live tier retries it (§8).
+class WarehouseFailed(Exception):           # failed, cancelled at the timeout, cut off, refused, or no reply in time. Never retried.
+    statement_id: str | None
+
+@dataclass(frozen=True)
+class WarehouseDecl:                        # the declaration. One per engine, kept in a registry in this module.
+    name: str                               # the value of warehouse.provider
+    dialect: str                            # the sqlglot dialect the compiler parses query.sql in (§7.2)
+    env_vars: tuple[str, ...]               # the credential variables, before env_prefix is added (§12.2)
+    config_keys: tuple[str, ...]            # the keys it takes under warehouse, besides provider
+
+class Warehouse(Protocol):                  # the transport. One module per engine, bot/warehouse/<name>.py
+    async def run(self, sql: str, params: list[Param], *, timeout_s: int, max_rows: int,
+                  credentials: str) -> QueryResult: ...
+```
+
+Rules for the code:
+
+- `run` is called from one place, the executor's live tier, with SQL read from the bundle. No other module imports a transport module, and a unit test checks that. The transport accepts SQL text, and the executor is the only code that can hand it any, so the rule in §8 still holds.
+- The declaration for the reference engine (§8.5) ships with the repo, because the sample catalog and the sample config are written for it (§10.4). It stays when the workplace runs another engine, and that engine gets its own declaration next to it.
+- Build one transport, for the engine the workplace has. In offline mode the fake warehouse is the transport, whatever `warehouse.provider` says, and the declaration still comes from config.
+
+What every transport must do:
+
+1. **Send the statement as given.** One statement per call. The transport does not parse, rewrite, or add to the SQL.
+2. **Bind parameters, never format them.** Values go through the engine's own parameter mechanism, by name and with a type. A `None` value binds a typed `NULL`. No value is ever written into the SQL text.
+3. **Enforce the timeout at the engine.** At `timeout_s` the statement is cancelled on the warehouse, not only abandoned by the client. `run` returns or raises within `timeout_s` plus 5 s. If the engine has not replied by then, `run` raises `WarehouseFailed` and cancels the statement if it knows its id. A late reply is not retryable, because the first statement may still be running.
+4. **Enforce the row limit and report a cut-off.** A result that was truncated or is incomplete raises `WarehouseFailed`. It is never returned as if it were whole.
+5. **Return rows in the normal form.** Every cell is a JSON value. A date is the string `YYYY-MM-DD`. A timestamp is an ISO 8601 string in UTC. A whole number is an integer and any other number is a float. A boolean is a boolean, a missing value is `null`, and anything else is a string. The transport converts from the column types the engine reports. The cache stores rows in this form (§8.2) and the renderer reads it (§8.1).
+6. **Return the engine's statement id.** It is the id that appears in the engine's query history. Jobs and cache objects record it, so one answer can be traced to one statement (§11).
+7. **Sign in as the warehouse identity** of the credentials block it is given. It reads the variables its declaration lists, with that block's `env_prefix`, at startup.
+8. **Do nothing else.** No retries, no result caching, no fallback to another engine. Retries belong to the live tier (§8) and caching to the cache tier.
+
+What the engine must offer for an adapter to be possible:
+
+- SQL with named, typed, bound parameters. The catalog writes markers as `:name`.
+- A read-only identity with table-level grants.
+- A server-side timeout or cancel, and a row limit that reports when it cut a result short.
+- A query history that an auditor can read for each identity.
+
+An engine that lacks one of these breaks a rule elsewhere in this spec, so it is a question for the owner and not an adapter detail. The same goes for an engine whose driver cannot bind `:name` markers by name. Do not rewrite SQL text at run time to make it fit.
+
+The catalog's SQL is written in the dialect of the configured engine, and the compiler parses it in that dialect. Moving to another engine means a new adapter and a review of every `query.sql`. It changes nothing else.
+
+One deployment has one warehouse. Sending some insights to a second engine is not built (Appendix B).
+
+### 8.5 Reference adapter: Databricks SQL
+
+This is the one adapter designed in detail. It is a worked example, and it is the adapter to build when the warehouse is Databricks SQL. For any other engine, write the same points for that engine in this shape before building its transport, and add its checks to "Verify during the build" in §14.
+
+- **Declaration:** `name` and `dialect` are both `databricks`. `env_vars` is `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`. `config_keys` is `host` and `warehouse_id` (§12.2).
+- **Identity:** a service principal with OAuth client credentials, `CAN USE` on one SQL warehouse, and `SELECT` on approved tables only. For example `sp-insightbot-<env>`.
+- **Sign-in:** `POST <host>/oidc/v1/token` with `grant_type=client_credentials` and `scope=all-apis`, and the client id and secret as HTTP basic authentication. Hold one token per credentials block in memory and fetch a new one shortly before it expires.
+- **Request:** one call to `POST /api/2.0/sql/statements`.
+  ```json
+  {
+    "warehouse_id": "<from config>",
+    "statement": "<SQL from the bundle>",
+    "parameters": [
+      {"name": "period_start", "value": "2026-10-12", "type": "DATE"},
+      {"name": "period_end",   "value": "2026-11-09", "type": "DATE"},
+      {"name": "region",       "value": "EMEA",       "type": "STRING"},
+      {"name": "plan_tier",    "type": "STRING"}
+    ],
+    "wait_timeout": "30s",
+    "on_wait_timeout": "CANCEL",
+    "row_limit": 500,
+    "disposition": "INLINE",
+    "format": "JSON_ARRAY"
+  }
+  ```
+  `wait_timeout` is `timeout_s` and `row_limit` is `max_rows`. The call blocks until the statement finishes or Databricks cancels it, so there is no polling loop. A parameter with no `value` binds `NULL`. Type mapping: `date` gives `DATE`, `string` gives `STRING`, `integer` gives `BIGINT`.
+- **Rows:** `JSON_ARRAY` returns every cell as a string or `null`. Convert each cell to the normal form in §8.4 with the column types in `manifest.schema.columns`.
+- **Outcomes:** `SUCCEEDED` with `truncated: false` returns the rows. `FAILED`, `CANCELED`, and `truncated: true` raise `WarehouseFailed` with the `statement_id`. HTTP 429, 5xx, and a network error before any reply raise `WarehouseRetryable`. HTTP 401 fetches a new token and tries once more, and a second 401 raises `WarehouseFailed`. Any other 4xx raises `WarehouseFailed`. So does no reply within `timeout_s` plus 5 s. The statement id is not known in that case, and `on_wait_timeout` has already told the warehouse to cancel at `timeout_s`.
+- **Query history:** the audit in §11 reads the workspace's query history, filtered by service principal.
 
 ---
 
@@ -908,8 +998,9 @@ There are no timers in the pilot. The analytics team owns the queue channel. Onc
 ```
 insight-bot/
   SPEC.md
-  bot/                    # listener, worker, router adapters, validator, executor, renderer, escalation, store
+  bot/                    # listener, worker, router adapters, warehouse adapters, validator, executor, renderer, escalation, store
   bot/fakes/              # fake Slack, warehouse, and router for offline mode (§10.4)
+  bot/warehouse/          # base.py: the interface and the declarations. One transport module per engine built (§8.4)
   catalog/insights/<domain>/<slug>/{insight.yaml, query.sql, tests.yaml}   # or answer.md for a doc insight
   catalog/calendar.yaml   # fiscal calendar (§6.3), shipped in the bundle
   sample/                 # sample catalog, synthetic data, router fixture, sample config (§10.4)
@@ -924,6 +1015,8 @@ insight-bot/
   agent/new-insight.md    # instructions for the workspace's coding agent (§10.3)
   agent/new-bot.md        # instructions for adding a bot (§10.3)
   docs/RUNBOOK.md         # one page for the operator (§12.5)
+  docs/queries.sql        # the saved queries (§12.3)
+  docs/PULL_REQUEST_TEMPLATE.md  # the catalog checklist, with the table-grant checkbox (§8). Move it to where the code host looks for one.
   CODEOWNERS              # example, for code hosts that have it: catalog/insights/finance/ @finance-analytics ; bot/ @bot-owners
   design-history/         # background only
 ```
@@ -931,14 +1024,14 @@ insight-bot/
 One repo keeps the router code and the routing tests together. Path filters separate the pipelines:
 - Changes under `catalog/` or `tools/` run the §10.2 checks. A merge that changed `catalog/` also publishes a bundle.
 - Changes under `bot/`, `tools/`, `prompts/`, `migrations/`, `Dockerfile`, or `config.yaml` build and deploy the image. `tools/` is in this list because the refresh, publish, and migrate tools run from the image. The deploy step runs `tools/migrate.py` before the new image rolls out (§12.4).
-- Changes to `config.yaml` also run the compiler, because a `bots` list in the catalog must name bots that exist.
+- Changes to `config.yaml` also run the compiler, because a `bots` list in the catalog must name bots that exist and the warehouse adapter sets the SQL dialect.
 - Every change runs the unit tests, the Postgres tests, and the offline checks in §10.4. They need no outside system.
 - Changes to `prompts/`, `config.yaml`, or the router code in `bot/` also run the routing eval, because the prompt, the model, and the threshold all change routing.
 
 ### 10.2 CI checks (all required to merge a catalog change)
 
 1. **Static:** the compiler rules in §7.2.
-2. **Execution:** run each changed insight, or every insight when `tools/` changed, with its `tests.yaml` parameters on the dev warehouse under a CI service principal. Every execution check goes through the executor with `live_only=True`, so CI never reads the cache. It must succeed, finish inside `timeout_s`, return at least `min_rows` rows, not be truncated, and contain every column named in `render`. Dashboard and doc insights are skipped. For an insight with a `cache` block the check also runs one grid point, the first combination in the order written, and confirms that the result builds a valid cache object (§8.2). Nothing is written to the bucket.
+2. **Execution:** run each changed insight, or every insight when `tools/` changed, with its `tests.yaml` parameters on the dev warehouse under a CI warehouse identity. The check uses the `default` credentials block, and CI sets that block's variables to the CI identity's values. The CI identity needs read access to every source table in the catalog. Every execution check goes through the executor with `live_only=True`, so CI never reads the cache. It must succeed, finish inside `timeout_s`, return at least `min_rows` rows, not be truncated, and contain every column named in `render`. Dashboard and doc insights are skipped. For an insight with a `cache` block the check also runs one grid point, the first combination in the order written, and confirms that the result builds a valid cache object (§8.2). Nothing is written to the bucket.
 3. **Routing eval:** build cards from the pull request's catalog and run every `example_utterance` and `negative_utterance` through `build_prompt`, the configured model, and `parse_decision`, with no thread context. The model and threshold come from `config.yaml`, the same settings the bot runs with. The eval runs **once per distinct catalog scope** (§7.4): for each bot, the cards are that bot's scope and the utterances are those of the insights in it. Two bots with the same scope share one run.
    - An example **passes** when the result is `answer` with its own insight and confidence at or above `T`. Parameters are not graded.
    - A negative **passes** when the result is anything other than `answer` with that insight at or above `T`.
@@ -958,7 +1051,7 @@ One repo keeps the router code and the routing tests together. Path filters sepa
 3. Runs the compiler, the execution test against the dev warehouse, and the routing eval. Iterates until green.
 4. Opens a pull request with the eval report in the description.
 
-The analyst reviews meaning, not YAML. Nothing becomes executable until a human approves and merges. Agent sessions use the CI service principal against dev, never production credentials.
+The analyst reviews meaning, not YAML. Nothing becomes executable until a human approves and merges. Agent sessions use the CI warehouse identity against dev, never production credentials.
 
 The same file covers the two other things an analyst may ask for:
 
@@ -971,26 +1064,27 @@ The same file covers the two other things an analyst may ask for:
 
 The whole bot runs with no outside system except Postgres. One environment flag, `INSIGHT_BOT_OFFLINE=1`, swaps in all four fakes at once. There are no per-fake switches, so a process is either fully offline or fully real:
 
-- With the flag set, the process uses the fake Slack, the fake warehouse, the `fake` router adapter, and the `local` store, whatever `router.provider` and `cache.backend` say in config.
+- With the flag set, the process uses the fake Slack, the fake warehouse, the `fake` router adapter, and the `local` store, whatever `router.provider`, `warehouse.provider`, and `cache.backend` say in config. The `local` store uses `cache.path`, or `./.cache` when the config names another backend. With no `cache` block the cache tier is off here too.
 - With the flag unset, `router.provider: fake` or `cache.backend: local` is a startup error (§12.1). A real process never runs on a fake by accident.
+- `warehouse.provider` always names the real engine and never takes `fake`. The compiler reads the SQL dialect from that engine's declaration (§8.4), in offline mode too. Offline mode swaps only the transport.
 
 | Real system | Fake | Behaviour |
 |---|---|---|
 | Slack | `bot/fakes/slack.py` | Replays events and interactions from a script file, in order, as if they came over the socket. Records every API call the bot makes, so a test can assert on what was posted, edited, and reacted to. Can be told to fail a given call with a given Slack error code. |
-| Warehouse | `bot/fakes/warehouse.py` | Serves rows for an insight from the synthetic data in `sample/`, keyed by insight and parameters. Checks that the statement and bound parameters it receives are the ones the bundle and the validator produce. Can be told to fail, cancel, or truncate. |
+| Warehouse | `bot/fakes/warehouse.py` | A transport that implements `run` (§8.4). It is built with the bundle and finds the insight by exact match on the statement text, so a statement that is not in the bundle is an error. Serves rows for that insight from the synthetic data in `sample/`, keyed by insight and parameters, in the normal form. Its statement ids are its own, such as `fake-1`. Checks that the statement and bound parameters it receives are the ones the bundle and the validator produce. Can be told to fail, cancel, or truncate. |
 | Router model | The `fake` adapter | Returns the decision listed for a bot id and a question in a fixture file, because two bots with different scopes can route the same question differently. A pair that is not in the fixture is an error, never a guess. |
 | Object store | The `local` backend (§8.2) | A directory. |
 
 Postgres is never faked. The tests connect to whatever `DATABASE_URL` names. `docker-compose.test.yaml` is a convenience that starts one locally. A pytest fixture applies the migrations to a fresh database for each test session. The failure paths in §5.2, §5.3, and §9 depend on row locks and transactions, and a mock would test the mock.
 
-**The sample catalog** in `sample/` holds three query insights, one doc insight, and one dashboard insight, with synthetic data for the fake warehouse, a router fixture covering every example and negative utterance, and a two-bot sample config. With it, on a fresh clone and with no credentials:
+**The sample catalog** in `sample/` holds three query insights, one doc insight, and one dashboard insight, with synthetic data for the fake warehouse, a router fixture covering every example and negative utterance, and a two-bot sample config. The sample config names the reference engine and the sample SQL is written in its dialect, which is why that engine's declaration ships with the repo (§8.4). An adopter on another engine leaves all three alone, because the sample only ever runs on the fake. Milestones 1 and 2 use only the first bot in the sample config. With it, on a fresh clone and with no credentials:
 
 - the compiler passes on the sample catalog,
 - the execution check passes against the fake warehouse,
 - the routing eval passes with the fake router, which proves the harness and the gates and says nothing about any real model,
-- the offline end-to-end tests pass: a scripted mention produces the expected posts for each tier, a clarify, a pick, an escalation, and an answered escalation.
+- the offline end-to-end tests pass: a scripted mention produces the expected posts for each tier, a dashboard insight, a clarify, a pick, an escalation, and an answered escalation.
 
-These run in CI on every change. The sample catalog is never published to a real environment, and `sample/` is not under `catalog/`.
+This is the state after milestone 5. Each milestone adds the part it builds (§13), and whatever exists runs in CI on every change. The sample catalog is never published to a real environment, and `sample/` is not under `catalog/`.
 
 What the fakes can and cannot show is stated per milestone in §13. A fake proves the bot's own logic. It proves nothing about how Slack, the warehouse, or a model really behave, which is what the "Verify during the build" list in §14 is for.
 
@@ -998,17 +1092,17 @@ What the fakes can and cannot show is stated per milestone in §13. A fake prove
 
 ## 11. Security
 
-- **Curated only:** enforced by the executor's single entry point (§8), the compiler (§7.2), and code review. Audited by comparing Databricks query history for every service principal the bot uses against published bundles. The cache refresh runs through the same entry point, so its statements pass the same audit.
+- **Curated only:** enforced by the executor's single entry point (§8), the compiler (§7.2), and code review. Audited by comparing the warehouse's query history for every warehouse identity the bot uses against published bundles. The audit is done by hand: every statement text in that history must equal the SQL of an insight in some row of `catalog_bundle`. The `statement_id` on a job or in a cache object traces one answer to one statement. The cache refresh runs through the same entry point, so its statements pass the same audit.
 - **Tiers:** no tier adds anything executable. A doc snippet is reviewed text posted as written, with broadcast and group mentions rejected by the compiler. A cache object holds rows the live tier already produced.
 - **Cache integrity:** anyone who can write the bucket can change what the bot posts for a cached answer. Give write access to the refresh tool only, and read access to the bot only. The bot checks an object's shape and identity (§8.2), not its truth.
 - **Bots:** a bot's catalog scope is a routing convenience, not an access control (§7.4). Every bot can reach the same data. Nothing restricted belongs in any bot's catalog or in the cache.
 - **Parameters:** typed, validated, and bound. No free text reaches SQL. No string concatenation anywhere near SQL in `bot/`.
-- **Table access:** each service principal can read only tables that governance granted by hand. The catalog cannot grant what Unity Catalog denies.
+- **Table access:** each warehouse identity can read only tables that governance granted by hand. The catalog cannot grant what the warehouse denies.
 - **Channels:** each bot answers only in its own allowlisted channels.
 - **Prompt injection:** question text is untrusted data in the prompt. The worst a hijacked router can do is pick a different approved insight with validated parameters, or write a misleading clarifying question, which is length-capped and stripped. Query results never enter a prompt.
 - **Data sent to the LLM provider:** question text, the bot's own earlier turns in the thread, and catalog cards. Confirm this is acceptable for the chosen provider.
 - **Slack exposure:** no public endpoint. Each bot's app holds three narrow scopes and cannot read channel history.
-- **Secrets:** a Slack bot token and a Slack app token per bot, the Postgres URL, Databricks client credentials per credentials block, object store credentials, and LLM credentials. All arrive as environment variables from the platform's existing secrets mechanism. None is ever written to the repo, `config.yaml`, a log line, or a cache object.
+- **Secrets:** a Slack bot token and a Slack app token per bot, the Postgres URL, warehouse credentials per credentials block, object store credentials, and LLM credentials. All arrive as environment variables from the platform's existing secrets mechanism. None is ever written to the repo, `config.yaml`, a log line, or a cache object.
 
 ---
 
@@ -1025,17 +1119,17 @@ The spec states what the platform must provide and names no platform. `deploy/` 
   - The object store is not part of readiness. A cache outage only makes answers live.
   - No inbound traffic from outside the platform is needed. Nothing is exposed publicly.
 - **Startup check:** before anything else, the bot and every tool validate the config file and list every required environment variable that is missing, all of them in one message, then exit non-zero. What is required depends on the entry point:
-  - The bot: the two Slack tokens for every bot, `DATABASE_URL`, the client id and secret for every credentials block a bot names, and the model credentials for the configured provider.
-  - `tools/refresh_cache.py`: `DATABASE_URL`, the client id and secret for the credentials blocks it will use (§8.3), write access to the bucket, and a `cache` block in config. No Slack tokens and no model credentials.
+  - The bot: the two Slack tokens for every bot, `DATABASE_URL`, the warehouse adapter's variables (§8.4) for every credentials block a bot names, and the variables the model adapter lists (§6.1).
+  - `tools/refresh_cache.py`: `DATABASE_URL`, the warehouse adapter's variables for the credentials blocks it will use (§8.3), write access to the bucket, and a `cache` block in config. No Slack tokens and no model credentials.
   - `tools/publish.py` and `tools/migrate.py`: `DATABASE_URL` only.
-  - `tools/run_tests.py`: the CI service principal's client id and secret. `tools/eval_routing.py`: the model credentials. `tools/compile.py`: nothing.
+  - `tools/run_tests.py`: the warehouse adapter's variables for the `default` credentials block, which CI fills with the CI warehouse identity's values (§10.2). `tools/eval_routing.py`: the model credentials. `tools/compile.py`: nothing.
   - In offline mode only `DATABASE_URL` is required, by the entry points that use Postgres.
-  - With `INSIGHT_BOT_OFFLINE` unset, `router.provider: fake` or `cache.backend: local` fails this check (§10.4).
+  - With `INSIGHT_BOT_OFFLINE` unset, `router.provider: fake` or `cache.backend: local` fails this check (§10.4). `warehouse.provider` must name a declared engine in either mode (§8.4). With the flag unset, that engine's transport must exist too.
 - Housekeeping loops catch and log every exception and carry on, the same way the worker loop does.
-- Outbound access required: Slack (HTTPS and WebSocket), the Databricks workspace, the LLM endpoint, the object store, Postgres.
+- Outbound access required: Slack (HTTPS and WebSocket), the warehouse, the LLM endpoint, the object store, Postgres.
 
 ### 12.2 Config
-Non-secret settings live in one YAML file. The bot, the tools, and CI all read the path in `CONFIG_PATH`, which defaults to `./config.yaml`. Channel ids, the workspace host, and the bucket differ between environments, so there is one file per environment and `CONFIG_PATH` selects it. The repo's `config.yaml` is the dev file. CI reads it, and it is built into the image as the default. The production file lives wherever the adopter keeps deployment settings. It holds no secrets, so it may sit in the repo beside the dev file. Bot ids, `router`, and `workers` are the same in every environment's file, so that a `bots` list in the catalog and a routing eval result mean the same thing everywhere. Secrets arrive as environment variables and never appear in this file. The fiscal calendar is not here. It lives in `catalog/calendar.yaml` and ships in the bundle.
+Non-secret settings live in one YAML file. The bot, the tools, and CI all read the path in `CONFIG_PATH`, which defaults to `./config.yaml`. Channel ids, the warehouse address, and the bucket differ between environments, so there is one file per environment and `CONFIG_PATH` selects it. The repo's `config.yaml` is the dev file. CI reads it, and it is built into the image as the default. The production file lives wherever the adopter keeps deployment settings. It holds no secrets, so it may sit in the repo beside the dev file. Bot ids, `router`, `warehouse.provider`, and `workers` are the same in every environment's file, so that a `bots` list in the catalog and a routing eval result mean the same thing everywhere. Secrets arrive as environment variables and never appear in this file. The fiscal calendar is not here. It lives in `catalog/calendar.yaml` and ships in the bundle.
 
 ```yaml
 bots:                                # at least one. A bot is a config entry, not a fork.
@@ -1054,12 +1148,12 @@ bots:                                # at least one. A bot is a config entry, no
       allowed_channels: [C0CCCCCCC]
       help_channel: C0CCCCCCC
       queue_channel: C0QQQQQQQ       # two bots may share a queue channel
-    credentials: finance_sp
+    credentials: finance
 credentials:                         # warehouse credentials. Shared by default.
   default:
-    env_prefix: ""                   # reads DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
-  finance_sp:
-    env_prefix: FINANCE_             # reads FINANCE_DATABRICKS_CLIENT_ID, FINANCE_DATABRICKS_CLIENT_SECRET
+    env_prefix: ""                   # the adapter names the variables (§8.4). Databricks SQL: DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET
+  finance:
+    env_prefix: FINANCE_             # for example FINANCE_DATABRICKS_CLIENT_ID, FINANCE_DATABRICKS_CLIENT_SECRET
 cache:                               # optional. Leave it out and the cache tier is off: every query answer is live.
   backend: s3                        # s3 | local. local is for offline mode and tests only (§10.4)
   bucket: "<bucket>"
@@ -1075,8 +1169,9 @@ router:                              # shared by all bots
   timeout_s: 10
   confidence_threshold: 0.80         # T
   eval_floor: 0.85                   # CI gate, §10.2. Placeholder until the first measured run.
-databricks:                          # shared by all bots
-  host: "https://<workspace host>"
+warehouse:                           # shared by all bots. One warehouse per deployment (§8.4)
+  provider: databricks               # selects the adapter. Never fake: offline mode swaps the fake in by itself (§10.4)
+  host: "https://<workspace host>"   # the remaining keys belong to the adapter. These two are the Databricks SQL adapter's (§8.5)
   warehouse_id: "<id>"
 workers:
   tasks: 16
@@ -1090,8 +1185,8 @@ Environment variables:
 |---|---|---|
 | `SLACK_BOT_TOKEN_<BOT_ID>`, `SLACK_APP_TOKEN_<BOT_ID>` | Once per bot | That bot's two Slack tokens. `<BOT_ID>` is the bot id in upper case, for example `SLACK_BOT_TOKEN_REVOPS`. |
 | `DATABASE_URL` | Always, including offline mode | Postgres connection string. |
-| `<env_prefix>DATABRICKS_CLIENT_ID`, `<env_prefix>DATABRICKS_CLIENT_SECRET` | Once per credentials block that a bot uses | Service principal credentials. |
-| `LLM_API_KEY`, or the provider's own variables | By the bot and the routing eval, unless offline | Model credentials. |
+| The warehouse adapter's credential variables, each with the block's `env_prefix` in front. For Databricks SQL: `<env_prefix>DATABRICKS_CLIENT_ID`, `<env_prefix>DATABRICKS_CLIENT_SECRET` | Once per credentials block that a bot uses | Warehouse identity credentials. |
+| `LLM_API_KEY`, or the variables the model adapter lists in `env_vars` (§6.1) | By the bot and the routing eval, unless offline | Model credentials. |
 | Object store credentials | Only when the platform gives the process no identity of its own | Whatever the S3 client reads by default. The bot needs read. The refresh tool needs write. |
 | `CONFIG_PATH` | Optional | Path to the config file. Default `./config.yaml`. |
 | `INSIGHT_BOT_OFFLINE` | Optional | `1` selects offline mode (§10.4). |
@@ -1099,12 +1194,12 @@ Environment variables:
 Rules:
 - The startup check in §12.1 validates this file and the variables together.
 - A secret is read from the environment at startup and held in memory. It is never logged, never echoed in an error, and never written anywhere.
-- Config is validated strictly: an unknown key is an error, so a typo cannot silently fall back to a default.
+- Config is validated strictly: an unknown key is an error, so a typo cannot silently fall back to a default. The keys allowed under `warehouse`, other than `provider`, are the ones the engine's declaration lists (§8.4). Under `cache`, `path` belongs to the `local` backend, and `bucket`, `prefix`, and `endpoint` belong to `s3`.
 - With one bot the suffix is still used. There is no unsuffixed `SLACK_BOT_TOKEN`.
 
 ### 12.3 Observability
 - Structured JSON logs carrying `job_id` and `bot_id` on every line.
-- The `jobs` table is the dashboard. Keep these as saved queries, each broken down by `bot_id`: questions per day by channel, decision mix, p50 and p95 of `finished_at - created_at`, failures by reason, no-match questions by frequency, open escalations by age, thumbs up and down by insight, and answers by `tier` per insight. The last one is the cache hit rate, and it shows which grids earn their refresh cost. One more saved query lists every insight that has a `cache` block in the live bundle and was answered yesterday with no answer from the cache tier. A cache miss is silent (§8), so this list is how a broken cache or a badly chosen grid gets noticed. Read it in the weekly review (§9.3).
+- The `jobs` table is the dashboard. Keep these as saved queries in `docs/queries.sql`, each broken down by `bot_id`: questions per day by channel, decision mix, p50 and p95 of `finished_at - created_at`, failures by reason, no-match questions by frequency, open escalations by age, thumbs up and down by insight, and answers by `tier` per insight. The last one is the cache hit rate, and it shows which grids earn their refresh cost. One more saved query lists every insight that has a `cache` block in the live bundle and was answered yesterday with no answer from the cache tier. A cache miss is silent (§8), so this list is how a broken cache or a badly chosen grid gets noticed. Read it in the weekly review (§9.3).
 - Alerts: more than 5 failed jobs in 10 minutes, any job queued for more than 60 s, any failed job still un-notified after 10 minutes, any replica not ready for more than 2 minutes, and a cache refresh run that exited non-zero or did not run. The first three are SQL checks over `jobs`, run on a schedule by whatever alerting tool the workspace already has. The fourth comes from the platform's readiness check. The fifth comes from whatever scheduler runs the refresh.
 
 ### 12.4 Migrations
@@ -1134,15 +1229,15 @@ Each milestone ends with something that works end to end. Milestones 1 to 5 are 
 
 | # | Milestone | Done on fakes when | Needs the real systems to show |
 |---|---|---|---|
-| 0 | **Prerequisites.** One Slack app per bot in Socket Mode with the scopes in §3. Managed Postgres. A service principal for each credentials block, with grants on the seed tables. LLM endpoint reachable. A bucket, needed from milestone 5. Secrets and outbound access. In the repo: the fakes, the sample catalog, the Postgres test fixture, `tools/migrate.py`, config loading with the startup check, the reference `Dockerfile`. | A fresh clone passes its tests with no credentials. The startup check names every missing variable and exits non-zero. | A replica can reach Slack, Postgres, the warehouse, and the model. |
-| 1 | **Walking skeleton.** One process, a hand-written bundle (§7.3 shape) with 3 query insights and 1 `kind: doc` insight, no queue. Mention, `build_prompt`, one adapter, `parse_decision`, validate, the doc tier and the live tier, render, reply. Anything that is not a confident, valid `answer` gets a fixed "I can't answer that yet" reply. | A scripted mention gets the expected query answer, and another gets the doc snippet with its footer. | A real question gets a real answer in a test channel, from a real model and a real query. This needs the seed queries. |
+| 0 | **Prerequisites.** One Slack app per bot in Socket Mode with the scopes in §3. Managed Postgres. A warehouse identity for each credentials block, with grants on the seed tables. LLM endpoint reachable. A bucket, needed from milestone 5. Secrets and outbound access. In the repo: the fakes, the sample catalog, the Postgres test fixture, `tools/migrate.py`, config loading with the startup check, the reference `Dockerfile`. | A fresh clone passes its tests with no credentials. The startup check names every missing variable and exits non-zero. | A replica can reach Slack, Postgres, the warehouse, and the model. |
+| 1 | **Walking skeleton.** One process, a hand-written bundle (§7.3 shape) with 3 query insights, 1 `kind: doc` insight, and 1 dashboard insight, no queue. Mention, `build_prompt`, the model adapters named in §6.1, `parse_decision`, validate, the doc tier, the dashboard reply, the live tier with one warehouse transport (§8.4), render, reply. Anything that is not a confident, valid `answer` gets a fixed "I can't answer that yet" reply. | A scripted mention gets the expected query answer, another gets the doc snippet with its footer, and a third gets the dashboard link. | A real question gets a real answer in a test channel, from a real model and a real query. This needs the seed queries. |
 | 2 | **Jobs table.** Listener and worker split, idempotent insert, claim loop, resumable `handle`, sweeper, graceful shutdown, `/health` and `/ready`. `bot_id` is on `jobs` and `escalations` and in every idempotency key from the start. One bot in config is enough here. Until milestone 4 the failure notifier posts only "Something went wrong on my side. Please try again." The bundle is still the hand-written file. | Killing a worker mid-question still produces a reply, and killing it before the post produces exactly one. Tested against the real Postgres. | The same, by killing a real replica. Also what Slack does with an unacknowledged event. |
 | 3 | **Clarify, picks, and a second bot.** Decision policy, option buttons, None of these, thread context, thumbs. `no_match` still gets the fixed reply from milestone 1. Add a second bot to the config. | "Now for APAC", a button click, and a typed reply to a clarify all work without a second mention of the metric. With two bots: each answers only in its own channels, each sees only its own thread turns, and an insight outside a bot's scope is `no_match` for that bot. | The same in a test workspace with two real Slack apps, including two sockets per replica and a button click reaching the bot that posted it. |
 | 4 | **Escalation.** `ensure_escalation`, queue card, Answer modal, answer posted back, catalog brief. Wire escalation into `no_match`, None of these, the clarify limit, and the failure notifier. Set up the §12.3 alerts and saved queries. Start `docs/RUNBOOK.md`. | Every row of the notifier's outcome table in §5.3, with the fake Slack failing on cue, against the real Postgres. An escalation is answered and the answer lands in the thread. | A no-match question is answered by a human in the original thread, through the real modal. The Slack error codes in §14. |
 | 5 | **Catalog pipeline and cache.** Compiler with the doc, cache, and scope rules. Execution tests including one grid point per cached insight. Routing eval per scope. Publish and rollback. `agent/new-insight.md` and `agent/new-bot.md`. The bot now loads the live bundle from Postgres and polls the pointer (§7.3). The store interface, the cache tier, and `tools/refresh_cache.py`. Complete `docs/RUNBOOK.md`. | The sample catalog compiles, publishes, and rolls back. After a refresh, a grid-point question is served with `tier = cache` and "as of". An off-grid question, a stale object, a wrong-date object, a corrupt object, a slow store, and a store that returns an error each fall through to live. | A new insight goes from brief to live through a pull request with no redeploy. A refresh fills a real bucket and a real question is served from it. The routing eval passes its floor with the real model. |
 | 6 | **Pilot.** 20 seed insights from the analytics team's most frequent questions, 2 to 3 channels, one bot unless a second is wanted from the start. | Not applicable. | Exit criteria below. |
 
-**Pilot exit criteria:** routing eval pass rate at or above 0.85. p95 under 15 s. Zero statements in query history, for any service principal the bot uses, that are not in a published bundle. At least 5 insights added from escalations through the paved path.
+**Pilot exit criteria:** routing eval pass rate at or above 0.85. p95 under 15 s. Zero statements in query history, for any warehouse identity the bot uses, that are not in a published bundle. At least 5 insights added from escalations through the paved path.
 
 ---
 
@@ -1160,6 +1255,7 @@ Each milestone ends with something that works end to end. Milestones 1 to 5 are 
 | Thread context from job rows, not Slack history | Three scopes instead of six, one less API call, less data handled. |
 | One confidence threshold; below it, offer buttons | A wrong number posted confidently costs more trust than one extra click. |
 | Provider-neutral router interface | The model is chosen at the workspace level. The routing eval is the acceptance test. |
+| The warehouse sits behind one adapter | The catalog rules, the validator, the tiers, and the cache are the same for any SQL engine. Which engine holds the data is a fact about the adopter, not about the design. A new engine costs one adapter and a review of the catalog's SQL. |
 | Static enum lists only | Dynamic lists need generated SQL, a refresh job, and a table. |
 | Hand-granted table access | Twenty insights touch a handful of tables. Automation can wait. |
 | Examples are tests, not prompt content | Otherwise the routing eval grades the model on questions it has already been shown. |
@@ -1171,34 +1267,36 @@ Each milestone ends with something that works end to end. Milestones 1 to 5 are 
 | A cached object must cover the dates the question means today | Otherwise the first question after midnight could get yesterday's "last 7 days". |
 | Many bots in one deployment, as config entries | One codebase, one queue, one catalog pipeline. A team gets a bot without a fork to maintain. |
 | Bots are scoped by catalog, not by data access | Scope stops a bot offering metrics its audience does not want. Everything in the catalog is public to employees, so there is nothing to wall off. |
-| Credentials can be set per bot and are shared by default | One service principal is the simple case. A second is there for budgets and audit lines, not for isolation. |
+| Credentials can be set per bot and are shared by default | One warehouse identity is the simple case. A second is there for budgets and audit lines, not for isolation. |
 | Offline mode with one switch, and Postgres never faked | Anyone can run and test the whole bot from a fresh clone. The failure paths are only as good as the locking they are tested against. |
 
 ### Open items for the workplace
 1. **Catalog publishing path.** Can CI reach production Postgres to publish bundles? If not, run `tools/publish.py` as a one-off job inside the platform, triggered by CI.
 2. **Ownership.** Who is on call for the bot, who staffs the analyst queue, and who in data governance approves and grants new source tables.
-3. **Dev and prod Databricks.** The spec assumes a dev warehouse for CI. With a single workspace, give CI its own read-only service principal on the same tables.
+3. **Dev and prod warehouse.** The spec assumes a dev warehouse for CI. With only one, give CI its own read-only warehouse identity on the same tables.
 4. **Model choice.** Any provider meeting §6.1. Not a blocker for milestones 0 to 2 beyond having one endpoint reachable.
 5. **Seed queries.** The analytics team supplies three real queries and their tables. The offline build does not need them, because it runs on the sample catalog. The real-system check of milestone 1 and the grants do.
-6. **Environments.** The spec assumes two, dev and prod. Each needs its own Slack app per bot, its own Postgres, its own bucket or prefix, its own config file (§12.2), and its own service principal for each credentials block. Two environments must never share a Slack app, because Slack delivers each event to only one connection and a dev replica would take production questions.
+6. **Environments.** The spec assumes two, dev and prod. Each needs its own Slack app per bot, its own Postgres, its own bucket or prefix, its own config file (§12.2), and its own warehouse identity for each credentials block. Two environments must never share a Slack app, because Slack delivers each event to only one connection and a dev replica would take production questions.
 7. **CI and deploy tooling.** The spec names no CI platform, image registry, container platform, or scheduler. Use the workplace standard and name an owner.
 8. **Bots.** Which bots exist at launch, and for each one its channels, its queue channel, and its audience. One bot is a fine answer.
 9. **Object store and refresh schedule.** Which bucket, who can write it, its lifecycle expiry, and which scheduler runs `tools/refresh_cache.py`. Not needed before milestone 5. The bot runs without a cache.
+10. **Warehouse.** Which SQL engine holds the data, and whether it offers what §8.4 asks for. Databricks SQL is designed in §8.5. Any other engine needs its own adapter section written and agreed before the real-system check of milestone 1. The offline build needs neither.
 
 ### Verify during the build
 - The chosen model reliably returns schema-valid structured output at temperature 0.
-- An omitted parameter `value` binds `NULL` on the workspace's Statement Execution API.
-- The warehouse result cache hits for an identical statement with identical bound parameters.
+- Databricks SQL adapter (§8.5): an omitted parameter `value` binds `NULL` on the Statement Execution API, a statement that reaches `wait_timeout` is cancelled on the warehouse, `JSON_ARRAY` returns cells as strings with the column types in the manifest, and the token request works as written.
+- The warehouse's own result cache, if it has one, hits for an identical statement with identical bound parameters.
 - The `view_submission` payload carries `view.id` and `private_metadata` as §5.1 assumes.
 - Socket Mode needs only `connections:write` on the app-level token.
 - The exact Slack error codes for a deleted thread and a deleted message, and the list of passing error codes named in §5.3, so the notifier's rules behave as written.
 - `chat.getPermalink`, `views.open`, and `chat.postEphemeral` work with the three scopes in §3 and need no others.
 - How many times, and how quickly, Slack retries an unacknowledged event over Socket Mode. The documented schedule is for HTTP delivery.
-- `(:region IS NULL OR region = :region)` runs with a typed `NULL` parameter on the workspace's warehouse.
+- `(:region IS NULL OR region = :region)` runs with a typed `NULL` parameter on the warehouse.
 - One process can hold Socket Mode connections for several Slack apps at once with the chosen Slack library, each with its own tokens.
 - Slack event ids and `view.id` values are unique within an app. The bot prefixes keys with the bot id either way, so this only confirms the reason.
 - A button click and a modal submission are always delivered to the app that posted the message, including in a channel that two bots share.
 - The chosen S3 client, against the adopter's store: a missing key is told apart from an error, and a read can be bounded at 2 s.
+- For a warehouse adapter other than the reference one: each of the eight points in §8.4, checked against the real engine. In particular, a typed `NULL` binds, the timeout cancels the statement at the engine, a cut-off result is reported, and the returned statement id appears in query history.
 
 ---
 
@@ -1227,47 +1325,22 @@ Not in the pilot. Each has a trigger for when to revisit. Detailed designs for m
 
 | Feature | Add it when |
 |---|---|
-| **Autoscaling on queue depth** | Jobs regularly wait more than 30 s in the queue. The example below is for KEDA on Kubernetes. Any autoscaler that can read a SQL count will do. |
+| **Autoscaling on queue depth** | Jobs regularly wait more than 30 s in the queue. Scale on `SELECT count(*) FROM jobs WHERE status = 'queued'`, aiming at about 10 queued jobs per replica, between 2 and 6 replicas. Any autoscaler that can read a SQL count will do, and its manifest belongs in `deploy/`. Stay at 8 replicas or fewer while the listeners run in every replica, because Slack allows 10 Socket Mode connections per app and a rolling update adds one. Before raising the ceiling, check the LLM rate limit, warehouse concurrency, and Postgres connections. |
 | Thread follow-ups without a mention | Pilot users complain about re-typing the mention. Needs the `message.channels` subscription and a security review. |
 | Slack thread history as router context | Users expect the bot to understand discussion it was not mentioned in. Needs history scopes. |
 | Dynamic enum lists read from dimension tables | Analysts are editing static lists more than monthly. The refresh SQL must itself be compiled into the bundle. |
 | Multi-value enums, entity lookup parameters | Real questions need "EMEA and APAC" or named customers. |
-| Decimal parameters | An insight needs a fractional threshold. Declare precision and scale per parameter, because a bare `DECIMAL` on Databricks has scale 0. |
+| Decimal parameters | An insight needs a fractional threshold. Declare precision and scale per parameter, because on some engines, Databricks SQL among them, a bare `DECIMAL` has scale 0. |
 | Eval report that shows changes against main | Reviewers cannot tell which older insight a new one took questions from. |
 | Reminders, claim, duplicate, and reject on the queue | Open escalations sit for more than a day. |
 | Source-table freshness in the footer of live answers, dashboard links with filters applied | Users ask "as of when?" about live answers. Cached answers already say. |
 | Tag-driven table grants | Hand grants become a bottleneck. |
 | Caching live answers on demand, off the grid | The saved queries show many repeated off-grid questions. Until then the grid and the warehouse's own result cache cover it. |
 | Free document retrieval | Doc insights are being added faster than one a day, or users ask for things that exist only in long documents. |
+| A second warehouse in the same deployment | Insights need data that lives in another engine. Needs a `source` field on each insight, and a dialect and credentials for each source. |
+| A source that is not a SQL engine, such as a reviewed table kept in a file or a sheet | Numbers people ask for exist only in a document. Needs its own rules for review, parameters, and freshness, because §8.4 assumes SQL. Text from a document is already covered by doc insights. |
 | Per-bot data access isolation | A bot needs a table another bot must not read. Needs per-bot cache separation and a scope check in the executor, and it ends "no per-user authorization" as a blanket rule, so it is a design change and not a setting. |
 | Retrieval before routing | A bot's scope passes roughly 150 insights, or the card prompt hurts latency or accuracy. |
 | Draft insights visible only in a beta channel | Analysts want to try an insight live before release. |
 | Eval set grown from real questions, weekly eval review | After the pilot, using thumbs-down and escalation data. |
 | Metrics and tracing beyond logs and SQL | The saved queries stop being enough. |
-
-```yaml
-# KEDA, for later. An example only. Keep maxReplicaCount at 8 or below while the listeners run in
-# every replica: Slack allows 10 Socket Mode connections per app and a rolling update adds one.
-# Before raising it, check the LLM rate limit, warehouse concurrency, and Postgres connections.
-apiVersion: keda.sh/v1alpha1
-kind: TriggerAuthentication
-metadata: { name: jobs-db }
-spec:
-  secretTargetRef:
-    - { parameter: connection, name: jobs-db-secret, key: url }
----
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata: { name: insight-bot }
-spec:
-  scaleTargetRef: { name: insight-bot }
-  minReplicaCount: 2
-  maxReplicaCount: 6
-  pollingInterval: 10
-  triggers:
-    - type: postgresql
-      metadata:
-        query: "SELECT count(*) FROM jobs WHERE status = 'queued'"
-        targetQueryValue: "10"
-      authenticationRef: { name: jobs-db }
-```
